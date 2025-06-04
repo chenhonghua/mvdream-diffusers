@@ -2,6 +2,7 @@
 
 import numpy as np
 import torch
+import random
 
 
 def create_camera_to_world_matrix(elevation, azimuth, cam_dist=1.0):
@@ -68,12 +69,69 @@ def normalize_camera(camera_matrix):
     return camera_matrix
 
 
-def get_camera(num_frames, elevation=15, azimuth_start=0, azimuth_span=360, opencv_coord=False, cam_dist=1.0):
+def get_camera(num_frames, elevation=15, azimuth_start=0, azimuth_span=360, opencv_coord=False, cam_dist=1.5):
     angle_gap = azimuth_span / num_frames
     cameras = []
     for azimuth in np.arange(azimuth_start, azimuth_span+azimuth_start, angle_gap):
+        # azimuth = random.uniform(0, 360)
+        # elevation = random.uniform(-30, 30)
         camera_matrix = create_camera_to_world_matrix(elevation, azimuth, cam_dist)
         if opencv_coord:
             camera_matrix = convert_blender_to_opencv(camera_matrix)
         cameras.append(camera_matrix)
     return torch.tensor(np.stack(cameras, 0)).float()
+
+def get_camera2(num_frames, elevation=15, azimuth_list=None, opencv_coord=False, cam_dist=1.5):
+    cameras = []
+    for i in range(4):
+        # azimuth = random.uniform(0, 360)
+        # elevation = random.uniform(-30, 30)
+        azimuth = azimuth_list[i]
+        camera_matrix = create_camera_to_world_matrix(elevation, azimuth, cam_dist)
+        if opencv_coord:
+            camera_matrix = convert_blender_to_opencv(camera_matrix)
+        cameras.append(camera_matrix)
+    return torch.tensor(np.stack(cameras, 0)).float()
+
+
+from kiui.cam import orbit_camera
+# def get_camera(
+#     num_frames, elevation=15, azimuth_start=0, azimuth_span=360, blender_coord=False, extra_view=False,
+# ):
+#     angle_gap = azimuth_span / num_frames
+#     cameras = []
+#     for azimuth in np.arange(azimuth_start, azimuth_span + azimuth_start, angle_gap):
+        
+#         pose = orbit_camera(-elevation, azimuth, radius=1) # kiui's elevation is negated, [4, 4]
+
+#         # opengl to blender
+#         if blender_coord:
+#             pose[2] *= -1
+#             pose[[1, 2]] = pose[[2, 1]]
+
+#         cameras.append(pose.flatten())
+
+#     if extra_view:
+#         cameras.append(np.zeros_like(cameras[0]))
+
+#     return torch.from_numpy(np.stack(cameras, axis=0)).float() # [num_frames, 16]
+
+def get_camera_GS(
+    num_frames, elevations, azimuths, blender_coord=False, extra_view=False,
+): 
+    cameras = []
+    for i in range(len(azimuths)):
+        azimuth = azimuths[i][0]
+        pose = create_camera_to_world_matrix(elevations[0][0], azimuth, cam_dist=1) 
+
+        # opengl to blender
+        if blender_coord:
+            pose[2] *= -1
+            pose[[1, 2]] = pose[[2, 1]]
+        cameras.append(pose)
+        # cameras.append(pose.flatten())
+
+    if extra_view:
+        cameras.append(np.zeros_like(cameras[0]))
+
+    return torch.from_numpy(np.stack(cameras, axis=0)).float() # [num_frames, 4, 4]

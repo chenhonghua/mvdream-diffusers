@@ -34,13 +34,16 @@ from diffusers.utils import (
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 
-from mvdream.unet import UNet2DConditionModel
-from mvdream.camera_proj import CameraMatrixEmbedding
-from mvdream.attention_processor import (
+from mvdream_diffusers.mvdream.unet import UNet2DConditionModel
+from mvdream_diffusers.mvdream.camera_proj import CameraMatrixEmbedding
+from mvdream_diffusers.mvdream.attention_processor import (
     CrossViewAttnProcessor, 
     XFormersCrossViewAttnProcessor, 
 )
 
+from mvdream_diffusers.mvdream.utils import get_camera, get_camera_GS
+from tqdm import tqdm
+import torch.nn.functional as F
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -265,7 +268,6 @@ class MVDreamPipeline(
             new_config["sample_size"] = 64
             unet._internal_dict = FrozenDict(new_config)
 
-
         self.register_modules(
             vae=vae,
             text_encoder=text_encoder,
@@ -281,6 +283,7 @@ class MVDreamPipeline(
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
         self.register_to_config(requires_safety_checker=requires_safety_checker)
+
 
     def enable_vae_slicing(self):
         r"""
@@ -347,7 +350,7 @@ class MVDreamPipeline(
             lora_scale=lora_scale,
             **kwargs,
         )
-
+        # import pdb;pdb.set_trace()
         # concatenate for backwards comp
         prompt_embeds = torch.cat([prompt_embeds_tuple[1], prompt_embeds_tuple[0]])
 
@@ -569,7 +572,7 @@ class MVDreamPipeline(
         image = self.vae.decode(latents, return_dict=False)[0]
         image = (image / 2 + 0.5).clamp(0, 1)
         # we always cast to float32 as this does not cause significant overhead and is compatible with bfloat16
-        image = image.cpu().permute(0, 2, 3, 1).float().numpy()
+        image = image.detach().cpu().permute(0, 2, 3, 1).float().numpy()
         return image
 
     def prepare_extra_step_kwargs(self, generator, eta):
@@ -753,6 +756,482 @@ class MVDreamPipeline(
     def num_timesteps(self):
         return self._num_timesteps
 
+    # @chh: DDIM inversion
+    @torch.no_grad()
+    def invert(
+        self,
+        prompt: str = "",
+        image: Optional[np.ndarray] = None, #4,h,w,c
+        c2ws: Optional[torch.FloatTensor] = None, #torch.Size([4, 16])
+        height: int = 256,
+        width: int = 256,
+        elevation: float = 0,
+        num_inference_steps: int = 50,
+        guidance_scale: float = 7.0,
+        negative_prompt: str = "",
+        num_images_per_prompt: int = 1,
+        eta: float = 0.0,
+        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+        output_type: Optional[str] = "numpy", # pil, numpy, latents
+        callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
+        callback_steps: int = 1,
+        num_frames: int = 4,
+        device=torch.device("cuda:0"),
+        latents=torch.Tensor,
+        text_embeddings_com: Optional[torch.FloatTensor] = None
+    ):
+        all_latents = [latents]
+        # all_latents = []
+        do_classifier_free_guidance = guidance_scale > 1.0
+
+        # Prepare timesteps
+        self.scheduler.set_timesteps(num_inference_steps, device=device)
+        timesteps = self.scheduler.timesteps
+
+        # imagedream variant
+        if image is not None:
+            assert isinstance(image, np.ndarray) and image.dtype == np.float32
+            self.image_encoder = self.image_encoder.to(device=device)
+            image_embeds_neg, image_embeds_pos = self.encode_image(image, device, num_images_per_prompt)
+            image_latents_neg, image_latents_pos = self.encode_image_latents(image, device, num_images_per_prompt)
+
+        # text embedding
+        prompt_embeds_pos = self.encode_prompt(
+            prompt=prompt,
+            device=device,
+            num_images_per_prompt=num_images_per_prompt,
+            do_classifier_free_guidance=do_classifier_free_guidance,
+            negative_prompt=negative_prompt,
+        )[0]
+        # if text_embeddings_com is not None:
+        #     prompt_embeds_pos = text_embeddings_com
+        
+        # Prepare latent variables
+        actual_num_frames = num_frames if image is None else num_frames + 1
+        latents: torch.Tensor = self.prepare_latents(
+            actual_num_frames * num_images_per_prompt,
+            4,
+            height,
+            width,
+            prompt_embeds_pos.dtype,
+            device,
+            generator,
+            latents,
+        )
+       
+        # Prepare camera matrix embeddings
+        if c2ws is not None:
+            batch_size = 1
+            if c2ws.ndim == 3:
+                c2ws = c2ws.unsqueeze(0)
+            if c2ws.shape[0] != batch_size and c2ws.shape[0] != 1:
+                raise ValueError("Size mismatch between `c2ws` and batch size.")
+            elif c2ws.shape[0] == 1:
+                c2ws = torch.cat([c2ws] * batch_size, dim=0)
+            c2ws = c2ws.repeat_interleave(num_images_per_prompt).reshape(-1, 4, 4).flatten(1, 2)
+            c2ws = c2ws.to(device, dtype=self.camera_proj.dtype)
+            camera_matrix_embeds = self.camera_proj(c2ws)
+            if do_classifier_free_guidance:
+                camera_matrix_embeds = torch.cat([camera_matrix_embeds] * 2)
+            # UNet use cross-view attention
+            self._set_unet_self_attn_cross_view_processor(actual_num_frames)
+
+        # Prepare extra step kwargs.
+        extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
+
+        # Denoising loop
+        num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+        with self.progress_bar(total=num_inference_steps) as progress_bar:
+            for i, t in enumerate(timesteps):
+                # expand the latents if we are doing classifier free guidance
+                multiplier = 2 if do_classifier_free_guidance else 1
+                latent_model_input = torch.cat([latents] * multiplier)
+                latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+
+                # predict the noise residual
+                noise_pred = self.unet(
+                    latent_model_input,
+                    t,
+                    encoder_hidden_states = torch.cat([prompt_embeds_pos] * actual_num_frames),
+                    camera_matrix_embeds = camera_matrix_embeds,
+                    return_dict = False,
+                )[0]
+
+                # perform guidance
+                if do_classifier_free_guidance:
+                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                    noise_pred = noise_pred_uncond + guidance_scale * (
+                        noise_pred_text - noise_pred_uncond
+                    )
+
+                # compute the previous noisy sample x_t -> x_t-1
+                latents: torch.Tensor = self.scheduler.step(
+                    noise_pred, t, latents, **extra_step_kwargs, return_dict=False
+                )[0]
+
+                # call the callback, if provided
+                if i == len(timesteps) - 1 or (
+                    (i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0
+                ):
+                    progress_bar.update()
+                    if callback is not None and i % callback_steps == 0:
+                        callback(i, t, latents)  # type: ignore
+                all_latents.append(latents)
+        return all_latents
+    # @chh: end
+
+    # @chh: apply uner once and obatin the noise
+    @torch.no_grad()
+    def apply_unet(
+        self,
+        latent_model_input,
+        t,
+        guidance_scale,
+        actual_num_frames,
+        prompt_embeds_neg: Optional[torch.FloatTensor] = None,
+        prompt_embeds_pos: Optional[torch.FloatTensor] = None,
+        c2ws: Optional[torch.FloatTensor] = None,
+        device: Optional[Union[str, torch.device]] = None,
+        return_unet_feature = False,
+    ):
+        
+        do_classifier_free_guidance = True if guidance_scale > 1.0 else False
+         
+        # Get camera latent
+        if c2ws is not None:
+            batch_size = 1
+            if c2ws.ndim == 3:
+                c2ws = c2ws.unsqueeze(0)
+            if c2ws.shape[0] != batch_size and c2ws.shape[0] != 1:
+                raise ValueError("Size mismatch between `c2ws` and batch size.")
+            elif c2ws.shape[0] == 1:
+                c2ws = torch.cat([c2ws] * batch_size, dim=0)
+            c2ws = c2ws.repeat_interleave(1).reshape(-1, 4, 4).flatten(1, 2)
+            c2ws = c2ws.to(device, dtype=self.camera_proj.dtype)
+            camera_matrix_embeds = self.camera_proj(c2ws)
+            if do_classifier_free_guidance:
+                camera_matrix_embeds = torch.cat([camera_matrix_embeds] * 2)
+            # UNet use cross-view attention
+            self._set_unet_self_attn_cross_view_processor(actual_num_frames)
+
+        # multiplier = 2 if do_classifier_free_guidance else 1
+        # latent_model_input = torch.cat([latent_model_input] * multiplier)
+        # latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+
+        if do_classifier_free_guidance:
+            latent_model_input = torch.cat([latent_model_input] * 2) #[8, 4, 32, 32] 
+            prompt_embeds_pos = torch.cat([prompt_embeds_neg, prompt_embeds_pos])
+            # torch.cat([prompt_embeds_pos] * actual_num_frames)
+
+            # predict the noise residual
+            # import pdb;pdb.set_trace()
+        
+            noise_pred = self.unet(
+                latent_model_input, #torch.Size([16, 4, 32, 32])
+                t,
+                encoder_hidden_states=prompt_embeds_pos, #torch.Size([8, 77, 1024])
+                camera_matrix_embeds=camera_matrix_embeds, #torch.Size([8, 1280])
+                return_dict=False,
+                return_unet_feature = return_unet_feature,
+            )[0]
+        else:
+            noise_pred = self.unet(
+                latent_model_input, #torch.Size([16, 4, 32, 32])
+                t,
+                encoder_hidden_states=prompt_embeds_pos, #torch.Size([8, 77, 1024])
+                camera_matrix_embeds=camera_matrix_embeds, #torch.Size([8, 1280])
+                return_dict=False,
+                return_unet_feature = return_unet_feature,
+            )[0]
+
+
+        if return_unet_feature:
+            return noise_pred # acctually, this noise_pred is the unet features
+        
+        # perform guidance
+        if do_classifier_free_guidance:
+            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+            noise_pred = noise_pred_uncond + guidance_scale * (
+                noise_pred_text - noise_pred_uncond
+            )
+
+        return noise_pred
+    # @chh: end
+
+    # @chh: get_unet_features
+    def get_unet_features(
+        self,
+        latent_model_input,
+        t,
+        guidance_scale,
+        actual_num_frames,
+        prompt_embeds_neg: Optional[torch.FloatTensor] = None,
+        prompt_embeds_pos: Optional[torch.FloatTensor] = None,
+        c2ws: Optional[torch.FloatTensor] = None,
+        device: Optional[Union[str, torch.device]] = None,
+        return_unet_feature = False,
+    ):
+        
+        do_classifier_free_guidance = True if guidance_scale > 1.0 else False
+         
+        # Get camera latent
+        if c2ws is not None:
+            batch_size = 1
+            if c2ws.ndim == 3:
+                c2ws = c2ws.unsqueeze(0)
+            if c2ws.shape[0] != batch_size and c2ws.shape[0] != 1:
+                raise ValueError("Size mismatch between `c2ws` and batch size.")
+            elif c2ws.shape[0] == 1:
+                c2ws = torch.cat([c2ws] * batch_size, dim=0)
+            c2ws = c2ws.repeat_interleave(1).reshape(-1, 4, 4).flatten(1, 2)
+            c2ws = c2ws.to(device, dtype=self.camera_proj.dtype)
+            camera_matrix_embeds = self.camera_proj(c2ws)
+            if do_classifier_free_guidance:
+                camera_matrix_embeds = torch.cat([camera_matrix_embeds] * 2)
+            # UNet use cross-view attention
+            self._set_unet_self_attn_cross_view_processor(actual_num_frames)
+
+        # multiplier = 2 if do_classifier_free_guidance else 1
+        # latent_model_input = torch.cat([latent_model_input] * multiplier)
+        # latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+
+        if do_classifier_free_guidance:
+            prompt_embeds_pos = torch.cat([prompt_embeds_neg, prompt_embeds_pos])
+            latent_model_input = torch.cat([latent_model_input] * 2)
+            # prompt_embeds_pos = (prompt_embeds_neg + prompt_embeds_pos)/2
+
+        # predict the noise residual
+        # import pdb;pdb.set_trace()
+        noise_pred = self.unet(
+            latent_model_input, #torch.Size([16, 4, 32, 32])
+            t,
+            encoder_hidden_states=prompt_embeds_pos, #torch.Size([8, 77, 1024])
+            camera_matrix_embeds=camera_matrix_embeds, #torch.Size([8, 1280])
+            return_dict=False,
+            return_unet_feature = return_unet_feature,
+        )[0]
+
+        if return_unet_feature:
+            return noise_pred # acctually, this noise_pred is the unet features
+        
+        # perform guidance
+        if do_classifier_free_guidance:
+            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+            noise_pred = noise_pred_uncond + guidance_scale * (
+                noise_pred_text - noise_pred_uncond
+            )
+
+        return noise_pred
+    # @chh: end
+
+    # @chh: train imagic for mv dream
+    def train(
+        self,
+        prompt: Union[str, List[str]],
+        image: Union[torch.FloatTensor, PIL.Image.Image],
+        c2ws: Optional[torch.FloatTensor] = None,
+        num_images_per_prompt: int = 1,
+        height: Optional[int] = 512,
+        width: Optional[int] = 512,
+        generator: Optional[torch.Generator] = None,
+        embedding_learning_rate: float = 0.001,
+        diffusion_model_learning_rate: float = 2e-6,
+        text_embedding_optimization_steps: int = 500,
+        model_fine_tuning_optimization_steps: int = 1000,
+        device=torch.device("cuda:0"),
+        **kwargs,
+    ):
+        r"""
+        Function invoked when calling the pipeline for generation.
+        Args:
+            prompt (`str` or `List[str]`):
+                The prompt or prompts to guide the image generation.
+            height (`int`, *optional*, defaults to 512):
+                The height in pixels of the generated image.
+            width (`int`, *optional*, defaults to 512):
+                The width in pixels of the generated image.
+            num_inference_steps (`int`, *optional*, defaults to 50):
+                The number of denoising steps. More denoising steps usually lead to a higher quality image at the
+                expense of slower inference.
+            guidance_scale (`float`, *optional*, defaults to 7.5):
+                Guidance scale as defined in [Classifier-Free Diffusion Guidance](https://arxiv.org/abs/2207.12598).
+                `guidance_scale` is defined as `w` of equation 2. of [Imagen
+                Paper](https://arxiv.org/pdf/2205.11487.pdf). Guidance scale is enabled by setting `guidance_scale >
+                1`. Higher guidance scale encourages to generate images that are closely linked to the text `prompt`,
+                usually at the expense of lower image quality.
+            eta (`float`, *optional*, defaults to 0.0):
+                Corresponds to parameter eta (η) in the DDIM paper: https://arxiv.org/abs/2010.02502. Only applies to
+                [`schedulers.DDIMScheduler`], will be ignored for others.
+            generator (`torch.Generator`, *optional*):
+                A [torch generator](https://pytorch.org/docs/stable/generated/torch.Generator.html) to make generation
+                deterministic.
+            latents (`torch.FloatTensor`, *optional*):
+                Pre-generated noisy latents, sampled from a Gaussian distribution, to be used as inputs for image
+                generation. Can be used to tweak the same generation with different prompts. If not provided, a latents
+                tensor will ge generated by sampling using the supplied random `generator`.
+            output_type (`str`, *optional*, defaults to `"pil"`):
+                The output format of the generate image. Choose between
+                [PIL](https://pillow.readthedocs.io/en/stable/): `PIL.Image.Image` or `nd.array`.
+            return_dict (`bool`, *optional*, defaults to `True`):
+                Whether or not to return a [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] instead of a
+                plain tuple.
+        Returns:
+            [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] or `tuple`:
+            [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] if `return_dict` is True, otherwise a `tuple.
+            When returning a tuple, the first element is a list with the generated images, and the second element is a
+            list of `bool`s denoting whether the corresponding generated image likely represents "not-safe-for-work"
+            (nsfw) content, according to the `safety_checker`.
+        """
+        from accelerate import Accelerator
+        accelerator = Accelerator(
+            gradient_accumulation_steps=1,
+            mixed_precision="fp16",
+        )
+
+        # if "torch_device" in kwargs:
+        #     device = kwargs.pop("torch_device")
+        #     logger.warning(
+        #         "`torch_device` is deprecated as an input argument to `__call__` and will be removed in v0.3.0."
+        #         " Consider using `pipe.to(torch_device)` instead."
+        #     )
+
+        #     if device is None:
+        #         device = "cuda" if torch.cuda.is_available() else "cpu"
+        #     self.to(device)
+
+        if height % 8 != 0 or width % 8 != 0:
+            raise ValueError(f"`height` and `width` have to be divisible by 8 but are {height} and {width}.")
+
+        # Freeze vae and unet
+        self.vae.requires_grad_(False)
+        self.unet.requires_grad_(False)
+        self.text_encoder.requires_grad_(False)
+        self.camera_proj.requires_grad_(False)
+        self.unet.eval()
+        self.vae.eval()
+        self.text_encoder.eval()
+        self.camera_proj.eval()
+
+        if accelerator.is_main_process:
+            accelerator.init_trackers(
+                "imagic",
+                config={
+                    "embedding_learning_rate": embedding_learning_rate,
+                    "text_embedding_optimization_steps": text_embedding_optimization_steps,
+                },
+            )
+
+        # get text embeddings for prompt
+        text_input = self.tokenizer(
+            prompt,
+            padding="max_length",
+            max_length=self.tokenizer.model_max_length,
+            truncation=True,
+            return_tensors="pt",
+        )
+        text_embeddings = torch.nn.Parameter(
+            self.text_encoder(text_input.input_ids.to(self.device))[0], requires_grad=True
+        )
+        text_embeddings = text_embeddings.detach()
+        text_embeddings.requires_grad_()
+        text_embeddings_orig = text_embeddings.clone()
+
+        # Initialize the optimizer
+        optimizer = torch.optim.Adam(
+            [text_embeddings],  # only optimize the embeddings
+            lr=embedding_learning_rate,
+        )
+
+        # encode mv images
+        image_np = np.array(image).astype(np.float32)/255.0
+        height, width = image_np.shape[:2]
+        subimages = [
+            image_np[0:height//2, 0:width//2],
+            image_np[0:height//2, width//2:width],
+            image_np[height//2:height, 0:width//2],
+            image_np[height//2:height, width//2:width]
+        ] #0 ,1 // 2, 3
+        subimages_tensors = [torch.from_numpy(subimg).permute(2, 0, 1) for subimg in subimages]
+        # subimages_tensors_half = [subimg_tensor.half() for subimg_tensor in subimages_tensors]
+        image_latents = []
+        for i, subimg_tensor in enumerate(subimages_tensors):
+            print(f"Subimage {i+1} shape: {subimg_tensor.shape}") # torch.Size([3, 256, 256])
+            subimg_tensor = subimg_tensor.unsqueeze(0).to(device)
+            subimg_tensor = 2. * subimg_tensor - 1.
+            posterior = self.vae.encode(subimg_tensor).latent_dist
+            latent = posterior.mean * 0.18215
+            image_latents.append(latent)
+        image_latents = torch.stack(image_latents, axis=0)
+        image_latents = image_latents.squeeze(1) #torch.Size([4, 4, 32, 32])
+
+        # encode camera condition
+          # Prepare camera matrix embeddings
+        if c2ws is not None:
+            batch_size = 1
+            if c2ws.ndim == 3:
+                c2ws = c2ws.unsqueeze(0)
+            if c2ws.shape[0] != batch_size and c2ws.shape[0] != 1:
+                raise ValueError("Size mismatch between `c2ws` and batch size.")
+            elif c2ws.shape[0] == 1:
+                c2ws = torch.cat([c2ws] * batch_size, dim=0)
+            c2ws = c2ws.repeat_interleave(num_images_per_prompt).reshape(-1, 4, 4).flatten(1, 2)
+            c2ws = c2ws.to(device, dtype=self.camera_proj.dtype)
+            camera_matrix_embeds = self.camera_proj(c2ws)
+            if False:#do_classifier_free_guidance:
+                camera_matrix_embeds = torch.cat([camera_matrix_embeds] * 2)
+            # UNet use cross-view attention
+            self._set_unet_self_attn_cross_view_processor(4)
+
+        progress_bar = tqdm(range(text_embedding_optimization_steps), disable=not accelerator.is_local_main_process)
+        progress_bar.set_description("Steps")
+
+        global_step = 0
+
+        logger.info("First optimizing the text embedding to better reconstruct the init image")
+        for _ in range(text_embedding_optimization_steps):
+            with accelerator.accumulate(text_embeddings):
+                # Sample noise that we'll add to the latents
+                noise = torch.randn(image_latents.shape).to(image_latents.device)
+                timesteps = torch.randint(1000, (1,), device=image_latents.device)
+
+                # Add noise to the latents according to the noise magnitude at each timestep
+                # (this is the forward diffusion process)
+                noisy_latents = self.scheduler.add_noise(image_latents, noise, timesteps)
+
+                # Predict the noise residual
+                # noise_pred = self.unet(noisy_latents, timesteps, text_embeddings).sample
+                # import pdb;pdb.set_trace()
+                noise_pred = self.unet(
+                    noisy_latents,
+                    timesteps,
+                    encoder_hidden_states=torch.cat([text_embeddings] * 4),
+                    camera_matrix_embeds=camera_matrix_embeds,
+                    return_dict=False,
+                )[0]
+
+                loss = F.mse_loss(noise_pred, noise, reduction="none").mean([1, 2, 3]).mean()
+                accelerator.backward(loss)
+
+                optimizer.step()
+                optimizer.zero_grad()
+
+            # Checks if the accelerator has performed an optimization step behind the scenes
+            if accelerator.sync_gradients:
+                progress_bar.update(1)
+                global_step += 1
+
+            logs = {"loss": loss.detach().item()}  # , "lr": lr_scheduler.get_last_lr()[0]}
+            progress_bar.set_postfix(**logs)
+            accelerator.log(logs, step=global_step)
+
+        accelerator.wait_for_everyone()
+
+        text_embeddings.requires_grad_(False)
+
+        self.text_embeddings_orig = text_embeddings_orig
+        self.text_embeddings = text_embeddings
+    # @chh: end
+    
     @torch.no_grad()
     # @replace_example_docstring(EXAMPLE_DOC_STRING)
     def __call__(
@@ -907,7 +1386,6 @@ class MVDreamPipeline(
             batch_size = len(prompt)
         else:
             batch_size = prompt_embeds.shape[0]
-
         device = self._execution_device
 
         # 3. Encode input prompt
@@ -926,6 +1404,9 @@ class MVDreamPipeline(
             lora_scale=lora_scale,
             clip_skip=self.clip_skip,
         )
+        # import pdb;pdb.set_trace()
+        # if self.text_embeddings is not None:
+        #     prompt_embeds = torch.cat([self.text_embeddings] * 4)
 
         # For classifier free guidance, we need to do two forward passes.
         # Here we concatenate the unconditional and text embeddings into a single batch
@@ -963,6 +1444,7 @@ class MVDreamPipeline(
             c2ws = c2ws.repeat_interleave(num_images_per_prompt).reshape(-1, 4, 4).flatten(1, 2)
             c2ws = c2ws.to(device, dtype=self.camera_proj.dtype)
             camera_matrix_embeds = self.camera_proj(c2ws)
+            # import pdb;pdb.set_trace()
             if self.do_classifier_free_guidance:
                 camera_matrix_embeds = torch.cat([camera_matrix_embeds] * 2)
             # UNet use cross-view attention
